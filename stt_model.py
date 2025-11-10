@@ -1,80 +1,82 @@
-from faster_whisper import WhisperModel
-from faster_whisper.transcribe import TranscriptionStream
+# stt_model.py
 import sounddevice as sd
 import numpy as np
 import queue
 import threading
-import time
+from faster_whisper import WhisperModel
 
-# 🔧 Audio Configuration
 samplerate = 16000
-block_duration = 0.25  # seconds per audio block (small = low latency)
-chunk_duration = 1.0   # process every 1 second for better accuracy
+block_duration = 0.5
+chunk_duration = 2
 channels = 1
 
 frames_per_block = int(samplerate * block_duration)
 frames_per_chunk = int(samplerate * chunk_duration)
 
-# 🧠 Model Initialization
-model_size = "tiny.en"  # Fastest for CPU
-model = WhisperModel(model_size, device="cpu", compute_type="int8")
-
-# 🎙️ Queues & Buffers
 audio_queue = queue.Queue()
 audio_buffer = []
+latest_transcript = ""
+recording_thread = None
+transcriber_thread = None
+stop_event = threading.Event()
 
-# ⚡ Streaming Whisper
-stream = TranscriptionStream(model, language="en")
+model_size = "tiny.en"
+model = WhisperModel(model_size, device="cpu", compute_type="float32")
 
-# 🎧 Callback for microphone input
-def audio_callback(indata, frames, time_info, status):
+
+def audio_callback(indata, frames, time, status):
     if status:
-        print("⚠️", status)
+        print(status)
     audio_queue.put(indata.copy())
 
-# 🎙️ Audio Recorder Thread
+
 def recorder():
-    """Continuously capture microphone input and store it in a queue."""
-    with sd.InputStream(
-        samplerate=samplerate,
-        channels=channels,
-        dtype="float32",
-        callback=audio_callback,
-        blocksize=frames_per_block,
-    ):
-        print("🎧 Listening... Press Ctrl+C to stop.")
-        while True:
+    """Continuously records audio and pushes blocks into a queue."""
+    with sd.InputStream(samplerate=samplerate, channels=channels,
+                        callback=audio_callback, blocksize=frames_per_block):
+        while not stop_event.is_set():
             sd.sleep(100)
 
-# 🧠 Transcriber Thread
+
 def transcriber():
-    """Continuously consume audio from queue and transcribe."""
-    global audio_buffer
-    while True:
+    """Processes audio chunks and updates the latest transcription."""
+    global audio_buffer, latest_transcript
+    while not stop_event.is_set():
         block = audio_queue.get()
         audio_buffer.append(block)
 
         total_frames = sum(len(b) for b in audio_buffer)
         if total_frames >= frames_per_chunk:
-            # Combine and reset buffer
-            audio_data = np.concatenate(audio_buffer)
+            audio_data = np.concatenate(audio_buffer)[:frames_per_chunk]
             audio_buffer = []
-
-            # Flatten to mono float32 array
             audio_data = audio_data.flatten().astype(np.float32)
 
-            # Feed chunk to streaming model
-            stream.feed_audio(audio_data)
+            segments, _ = model.transcribe(
+                audio_data,
+                language='en',
+                vad_filter=True,
+                beam_size=1
+            )
 
-            # Get live partial transcript
-            text = stream.get_text().strip()
-            if text:
-                print(f"🗣️ {text}")
-            else:
-                print("... (no speech detected)")
-        time.sleep(0.05)  # prevent busy-waiting
+            text = " ".join([seg.text for seg in segments]).strip()
+            latest_transcript += " " + text
+            print("Transcribed:", text)
 
-# 🧵 Launch Threads
-if __name__ == "__main__":
-    threading.Thread(target=recorder, daemon=True).start()
-    transcriber()
+
+def start_transcription():
+    global stop_event, recording_thread, transcriber_thread, latest_transcript
+    stop_event.clear()
+    latest_transcript = ""
+    recording_thread = threading.Thread(target=recorder, daemon=True)
+    transcriber_thread = threading.Thread(target=transcriber, daemon=True)
+    recording_thread.start()
+    transcriber_thread.start()
+
+
+def stop_transcription():
+    stop_event.set()
+
+
+def get_transcription():
+    """Returns current transcription text."""
+    return latest_transcript.strip()
